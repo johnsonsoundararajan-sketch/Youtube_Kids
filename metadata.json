@@ -1,0 +1,6 @@
+{
+  "name": "Bible Kids Video Creator",
+  "description": "AI-powered Bible story, narration, animated video, background music, and YouTube publishing studio for kids.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
