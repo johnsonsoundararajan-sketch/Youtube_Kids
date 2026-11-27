@@ -3,6 +3,7 @@ import express, { type Request, type Response } from 'express';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
 import { GoogleGenAI, Type } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -691,6 +692,348 @@ Requirements:
       res.status(500).json({ error: message });
     }
   });
+
+  interface UploadSession {
+    uploadUrl: string;
+    channelTitle: string;
+    channelHandle: string;
+    mimeType: string;
+    expiresAt: number;
+  }
+
+  const uploadSessions = new Map<string, UploadSession>();
+
+  function mapYouTubeCategoryId(category: string): string {
+    const lower = (category || '').toLowerCase();
+    if (lower.includes('film') || lower.includes('animation')) return '1';
+    if (lower.includes('music')) return '10';
+    if (lower.includes('people') || lower.includes('blog')) return '22';
+    if (lower.includes('entertainment')) return '24';
+    return '27'; // Education
+  }
+
+  function sanitizeYouTubeTags(rawTags: string[]): string[] {
+    const clean: string[] = [];
+    let totalLen = 0;
+    for (const raw of rawTags) {
+      const t = String(raw || '')
+        .replace(/^#+/, '')
+        .replace(/[<>]/g, '')
+        .trim();
+      if (!t || clean.includes(t)) continue;
+      if (totalLen + t.length + 2 > 450) break;
+      clean.push(t);
+      totalLen += t.length + 2;
+    }
+    return clean;
+  }
+
+  function toScheduledUtcIso(
+    dateStr: string,
+    timeStr: string,
+    timezone: string
+  ): string {
+    const [year, month, day] = dateStr.split('-').map(Number);
+    const [hour, minute] = timeStr.split(':').map(Number);
+    if (!year || !month || !day) {
+      return new Date(Date.now() + 3_600_000).toISOString();
+    }
+    const localGuess = new Date(
+      Date.UTC(year, month - 1, day, hour || 0, minute || 0, 0)
+    );
+    try {
+      const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: timezone || 'UTC',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+      const parts = Object.fromEntries(
+        fmt.formatToParts(localGuess).map((p) => [p.type, p.value])
+      );
+      const tzRenderedUtc = Date.UTC(
+        Number(parts.year),
+        Number(parts.month) - 1,
+        Number(parts.day),
+        Number(parts.hour === '24' ? '0' : parts.hour),
+        Number(parts.minute),
+        Number(parts.second)
+      );
+      const offsetMs = tzRenderedUtc - localGuess.getTime();
+      const target = new Date(localGuess.getTime() - offsetMs);
+      return target.toISOString();
+    } catch {
+      return localGuess.toISOString();
+    }
+  }
+
+  app.post('/api/youtube/upload/init', async (req: Request, res: Response) => {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        res.status(401).json({
+          error: 'Missing Google OAuth Bearer token. Please sign in with Google first.',
+        });
+        return;
+      }
+      const accessToken = authHeader.slice(7).trim();
+
+      const {
+        title,
+        description,
+        tags = [],
+        hashtags = [],
+        category = 'Education',
+        language = 'English',
+        scheduledDate,
+        scheduledTime,
+        timezone = 'UTC',
+        privacyMode = 'scheduled',
+        contentLength,
+        mimeType = 'video/mp4',
+      } = req.body ?? {};
+
+      if (!title || !description || !contentLength) {
+        res.status(400).json({
+          error: 'Video title, description, and contentLength are required.',
+        });
+        return;
+      }
+
+      // 1. Verify connected YouTube channel via Bearer token
+      const chRes = await fetch(
+        'https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true',
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      const chJson = (await chRes.json().catch(() => ({}))) as {
+        items?: Array<{
+          id?: string;
+          snippet?: { title?: string; customUrl?: string };
+        }>;
+        error?: { message?: string };
+      };
+      if (!chRes.ok) {
+        res.status(chRes.status).json({
+          error:
+            chJson.error?.message ||
+            'Failed to verify your YouTube channel permissions.',
+        });
+        return;
+      }
+
+      const channel = chJson.items?.[0];
+      if (!channel) {
+        res.status(400).json({
+          error:
+            'No YouTube channel found on the signed-in Google account. Please select your @A-VerseForYou channel account.',
+        });
+        return;
+      }
+
+      const channelTitle = channel.snippet?.title || 'YouTube Channel';
+      const channelHandle = channel.snippet?.customUrl || channel.id || '';
+
+      // 2. Prepare YouTube Data API v3 snippet & status
+      const hashtagBlock = Array.isArray(hashtags) && hashtags.length
+        ? `\n\n${hashtags.slice(0, 15).join(' ')}`
+        : '';
+      const fullDescription = `${String(description).trim()}${hashtagBlock}`.slice(
+        0,
+        4950
+      );
+
+      const statusPayload: Record<string, unknown> = {
+        selfDeclaredMadeForKids: true,
+      };
+
+      let scheduledIso = new Date().toISOString();
+      if (privacyMode === 'scheduled' && scheduledDate && scheduledTime) {
+        const targetUtc = toScheduledUtcIso(
+          scheduledDate,
+          scheduledTime,
+          timezone
+        );
+        const targetMs = new Date(targetUtc).getTime();
+        if (targetMs > Date.now() + 60_000) {
+          statusPayload.privacyStatus = 'private';
+          statusPayload.publishAt = targetUtc;
+          scheduledIso = targetUtc;
+        } else {
+          statusPayload.privacyStatus = 'private';
+        }
+      } else if (
+        privacyMode === 'public' ||
+        privacyMode === 'unlisted' ||
+        privacyMode === 'private'
+      ) {
+        statusPayload.privacyStatus = privacyMode;
+      } else {
+        statusPayload.privacyStatus = 'private';
+      }
+
+      const langCode = language === 'Tamil' ? 'ta' : 'en';
+      const videoResource = {
+        snippet: {
+          title: String(title).trim().slice(0, 100),
+          description: fullDescription,
+          tags: sanitizeYouTubeTags(Array.isArray(tags) ? tags : []),
+          categoryId: mapYouTubeCategoryId(category),
+          defaultLanguage: langCode,
+          defaultAudioLanguage: langCode,
+        },
+        status: statusPayload,
+      };
+
+      const initRes = await fetch(
+        'https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json; charset=UTF-8',
+            'X-Upload-Content-Length': String(contentLength),
+            'X-Upload-Content-Type': String(mimeType || 'video/mp4'),
+          },
+          body: JSON.stringify(videoResource),
+        }
+      );
+
+      if (!initRes.ok) {
+        const errData = (await initRes.json().catch(() => ({}))) as {
+          error?: { message?: string };
+        };
+        res.status(initRes.status).json({
+          error:
+            errData.error?.message ||
+            `YouTube upload initialization failed (HTTP ${initRes.status}).`,
+        });
+        return;
+      }
+
+      const uploadUrl = initRes.headers.get('location');
+      if (
+        !uploadUrl ||
+        (!uploadUrl.startsWith('https://www.googleapis.com/') &&
+          !uploadUrl.startsWith('https://upload.youtube.com/'))
+      ) {
+        res.status(502).json({
+          error: 'YouTube API did not return a valid resumable upload URL.',
+        });
+        return;
+      }
+
+      // Clean expired sessions
+      const now = Date.now();
+      for (const [k, v] of uploadSessions.entries()) {
+        if (v.expiresAt < now) uploadSessions.delete(k);
+      }
+
+      const uploadSessionId = crypto.randomUUID();
+      uploadSessions.set(uploadSessionId, {
+        uploadUrl,
+        channelTitle,
+        channelHandle,
+        mimeType: String(mimeType || 'video/mp4'),
+        expiresAt: now + 15 * 60_000,
+      });
+
+      res.json({
+        uploadSessionId,
+        channelTitle,
+        channelHandle,
+        scheduledIso,
+      });
+    } catch (error: unknown) {
+      console.error('YouTube upload init error:', error);
+      res.status(500).json({
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Failed to initialize YouTube upload.',
+      });
+    }
+  });
+
+  app.post(
+    '/api/youtube/upload/binary',
+    express.raw({ type: 'application/octet-stream', limit: '250mb' }),
+    async (req: Request, res: Response) => {
+      try {
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          res.status(401).json({ error: 'Missing OAuth Bearer token.' });
+          return;
+        }
+        const accessToken = authHeader.slice(7).trim();
+        const sessionId = String(req.headers['x-upload-session-id'] || '');
+        const session = uploadSessions.get(sessionId);
+        if (!session || session.expiresAt < Date.now()) {
+          uploadSessions.delete(sessionId);
+          res.status(400).json({ error: 'Upload session expired or invalid.' });
+          return;
+        }
+        uploadSessions.delete(sessionId);
+
+        const videoBuffer = req.body as Buffer;
+        if (!Buffer.isBuffer(videoBuffer) || videoBuffer.length === 0) {
+          res.status(400).json({ error: 'Empty video binary payload.' });
+          return;
+        }
+
+        const putRes = await fetch(session.uploadUrl, {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': session.mimeType,
+            'Content-Length': String(videoBuffer.length),
+          },
+          body: new Uint8Array(videoBuffer),
+        });
+
+        const uploaded = (await putRes.json().catch(() => ({}))) as {
+          id?: string;
+          status?: { privacyStatus?: string; publishAt?: string };
+          error?: { message?: string };
+        };
+
+        if (!putRes.ok || !uploaded.id) {
+          res.status(putRes.status || 502).json({
+            error:
+              uploaded.error?.message ||
+              `YouTube video upload failed (HTTP ${putRes.status}).`,
+          });
+          return;
+        }
+
+        res.json({
+          publishId: uploaded.id,
+          videoId: uploaded.id,
+          youtubeUrl: `https://www.youtube.com/watch?v=${uploaded.id}`,
+          studioUrl: `https://studio.youtube.com/video/${uploaded.id}/edit`,
+          channelTitle: session.channelTitle,
+          channelHandle: session.channelHandle,
+          publishedAt: new Date().toISOString(),
+          scheduledIso:
+            uploaded.status?.publishAt || new Date().toISOString(),
+          status: uploaded.status?.publishAt ? 'Scheduled' : 'Uploaded',
+        });
+      } catch (error: unknown) {
+        console.error('YouTube binary upload error:', error);
+        res.status(500).json({
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Failed to upload video to YouTube.',
+        });
+      }
+    }
+  );
 
   app.post('/api/youtube/publish', (req: Request, res: Response) => {
     const payload = req.body ?? {};

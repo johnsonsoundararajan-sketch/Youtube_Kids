@@ -1,25 +1,35 @@
 import { useEffect, useState } from 'react';
 import {
+  AlertTriangle,
   Calendar,
   Check,
   CheckCircle2,
   Clock,
   Copy,
+  ExternalLink,
   Globe,
   Loader2,
   Mic,
   Send,
+  ShieldCheck,
   Upload,
   Volume2,
   X,
 } from 'lucide-react';
+import { GoogleSignInButton } from './GoogleSignInButton';
+import {
+  TARGET_CHANNEL_HANDLE,
+  TARGET_CHANNEL_URL,
+} from '../lib/youtubeAuth';
 import type {
   GeneratedStory,
   PublishPayload,
   PublishResult,
   StoryLanguage,
   VoiceOption,
+  YouTubeChannelInfo,
   YouTubeMetadata,
+  YouTubePrivacyMode,
 } from '../types/story';
 import type { UI_COPY } from '../lib/i18n';
 
@@ -29,6 +39,11 @@ interface ApprovalModalProps {
   durationSeconds: number;
   videoUrl: string | null;
   initialMetadata?: YouTubeMetadata;
+  accessToken: string | null;
+  connectedChannel: YouTubeChannelInfo | null;
+  isSigningIn: boolean;
+  authError: string | null;
+  onGoogleSignIn: () => void;
   copy: (typeof UI_COPY)['en'];
   onClose: () => void;
   onMetadataReady: (meta: YouTubeMetadata) => void;
@@ -59,6 +74,11 @@ export function ApprovalModal({
   durationSeconds,
   videoUrl,
   initialMetadata,
+  accessToken,
+  connectedChannel,
+  isSigningIn,
+  authError,
+  onGoogleSignIn,
   copy,
   onClose,
   onMetadataReady,
@@ -72,7 +92,7 @@ export function ApprovalModal({
   const [copied, setCopied] = useState(false);
   const [copiedPrompt, setCopiedPrompt] = useState(false);
 
-  // Scheduling state
+  // Scheduling & privacy state
   const tomorrow = new Date(Date.now() + 86_400_000)
     .toISOString()
     .split('T')[0];
@@ -83,6 +103,7 @@ export function ApprovalModal({
   const [timezone, setTimezone] = useState(
     TIMEZONES.includes(localTz) ? localTz : 'UTC'
   );
+  const [privacyMode, setPrivacyMode] = useState<YouTubePrivacyMode>('scheduled');
 
   // Voice Preview state
   const [previewSpeaker, setPreviewSpeaker] = useState<VoiceOption>(
@@ -96,8 +117,10 @@ export function ApprovalModal({
   const [loadingPreview, setLoadingPreview] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
 
-  // Upload state
+  // Upload & Confirmation state
+  const [confirmingUpload, setConfirmingUpload] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadStage, setUploadStage] = useState<string>('');
   const [publishResult, setPublishResult] = useState<PublishResult | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
 
@@ -108,8 +131,10 @@ export function ApprovalModal({
     setPreviewText(
       story.scenes[0]?.narrationSegment || story.narrationScript.slice(0, 220)
     );
+    setConfirmingUpload(false);
     setPublishResult(null);
     setUploadError(null);
+    setUploadStage('');
 
     if (initialMetadata) {
       setMetadata(initialMetadata);
@@ -221,8 +246,27 @@ export function ApprovalModal({
     }
   };
 
-  const handleUploadToYouTube = async () => {
+  const handleRequestUpload = () => {
+    setUploadError(null);
     if (!metadata) return;
+    if (!videoUrl) {
+      setUploadError(
+        'No rendered video file found in memory. Please close this popup and click Regenerate Video first.'
+      );
+      return;
+    }
+    if (!accessToken) {
+      setUploadError(
+        `Please sign in with Google above and select your ${TARGET_CHANNEL_HANDLE} YouTube channel before uploading.`
+      );
+      return;
+    }
+    setConfirmingUpload(true);
+  };
+
+  const handleConfirmUploadToYouTube = async () => {
+    if (!metadata || !videoUrl || !accessToken) return;
+    setConfirmingUpload(false);
     setUploading(true);
     setUploadError(null);
 
@@ -236,25 +280,82 @@ export function ApprovalModal({
       scheduledDate,
       scheduledTime,
       timezone,
-      videoUrl: videoUrl || '',
+      privacyMode,
+      videoUrl,
     };
 
     try {
-      const res = await fetch('/api/youtube/publish', {
+      setUploadStage('Reading animated video file...');
+      const videoBlob = await fetch(videoUrl).then((r) => r.blob());
+      if (!videoBlob || videoBlob.size === 0) {
+        throw new Error('Rendered video file is empty.');
+      }
+
+      setUploadStage('Initializing YouTube Data API v3 upload...');
+      const initRes = await fetch('/api/youtube/upload/init', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          title: metadata.title,
+          description: metadata.description,
+          tags: [...metadata.tags, ...metadata.keywords],
+          hashtags: metadata.hashtags,
+          category: metadata.category,
+          language: story.language,
+          scheduledDate,
+          scheduledTime,
+          timezone,
+          privacyMode,
+          contentLength: videoBlob.size,
+          mimeType: videoBlob.type || 'video/mp4',
+        }),
       });
-      const result = await res.json();
-      if (!res.ok) throw new Error(result.error || 'Publish request failed');
-      setPublishResult(result as PublishResult);
-      onPublished(result as PublishResult);
+      const initJson = await initRes.json();
+      if (!initRes.ok) {
+        throw new Error(initJson.error || 'Failed to initialize YouTube upload.');
+      }
+
+      setUploadStage(
+        `Uploading ${(videoBlob.size / (1024 * 1024)).toFixed(1)} MB video to ${initJson.channelHandle || initJson.channelTitle}...`
+      );
+      const binRes = await fetch('/api/youtube/upload/binary', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          Authorization: `Bearer ${accessToken}`,
+          'x-upload-session-id': initJson.uploadSessionId,
+        },
+        body: videoBlob,
+      });
+      const uploadedJson = await binRes.json();
+      if (!binRes.ok) {
+        throw new Error(uploadedJson.error || 'YouTube binary upload failed.');
+      }
+
+      const finalResult: PublishResult = {
+        publishId: uploadedJson.publishId,
+        videoId: uploadedJson.videoId,
+        youtubeUrl: uploadedJson.youtubeUrl,
+        studioUrl: uploadedJson.studioUrl,
+        channelTitle: uploadedJson.channelTitle,
+        channelHandle: uploadedJson.channelHandle,
+        publishedAt: uploadedJson.publishedAt,
+        scheduledIso: uploadedJson.scheduledIso,
+        status: uploadedJson.status,
+        payload,
+      };
+      setPublishResult(finalResult);
+      onPublished(finalResult);
     } catch (err) {
       setUploadError(
-        err instanceof Error ? err.message : 'Failed to upload package.'
+        err instanceof Error ? err.message : 'Failed to upload video to YouTube.'
       );
     } finally {
       setUploading(false);
+      setUploadStage('');
     }
   };
 
@@ -307,24 +408,116 @@ export function ApprovalModal({
 
         {/* Scrollable Content */}
         <div className="flex-1 overflow-y-auto px-6 py-6 space-y-8">
+          {/* Connected YouTube Channel Account */}
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/60 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div>
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Target Channel:{' '}
+                  <a
+                    href={TARGET_CHANNEL_URL}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-semibold text-violet-700 dark:text-violet-400 hover:underline"
+                  >
+                    {TARGET_CHANNEL_HANDLE}
+                  </a>
+                </div>
+                {connectedChannel ? (
+                  <div className="mt-1.5 flex items-center gap-2.5">
+                    {connectedChannel.thumbnailUrl && (
+                      <img
+                        src={connectedChannel.thumbnailUrl}
+                        alt={connectedChannel.title}
+                        referrerPolicy="no-referrer"
+                        className="h-7 w-7 rounded-full border border-slate-200 dark:border-slate-700 object-cover"
+                      />
+                    )}
+                    <div className="text-sm font-semibold text-slate-900 dark:text-white">
+                      {connectedChannel.title}{' '}
+                      <span className="font-mono text-xs font-normal text-slate-500 dark:text-slate-400">
+                        ({connectedChannel.customUrl})
+                      </span>
+                    </div>
+                    {connectedChannel.matchesTargetChannel && (
+                      <span className="inline-flex items-center gap-1 text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+                        <ShieldCheck className="h-3.5 w-3.5" />
+                        Verified Channel
+                      </span>
+                    )}
+                  </div>
+                ) : (
+                  <p className="mt-1 text-sm text-slate-700 dark:text-slate-300">
+                    Connect your Google account managing {TARGET_CHANNEL_HANDLE} to upload directly via YouTube Data API v3.
+                  </p>
+                )}
+              </div>
+
+              <div className="flex items-center gap-2">
+                <GoogleSignInButton
+                  onClick={onGoogleSignIn}
+                  loading={isSigningIn}
+                  label={
+                    accessToken ? 'Switch YouTube Account' : 'Sign in with Google'
+                  }
+                />
+              </div>
+            </div>
+
+            {connectedChannel && !connectedChannel.matchesTargetChannel && (
+              <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+                <span>
+                  Connected channel is <strong>{connectedChannel.title}</strong> ({connectedChannel.customUrl}), which differs from <strong>{TARGET_CHANNEL_HANDLE}</strong>. Click Switch YouTube Account above to select your @A-VerseForYou Brand Account, or proceed if intentional.
+                </span>
+              </div>
+            )}
+
+            {authError && (
+              <p className="mt-2 text-xs text-rose-600 dark:text-rose-400">
+                {authError}
+              </p>
+            )}
+          </div>
+
           {/* Success Notification */}
           {publishResult && (
             <div className="rounded-xl border border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/50 p-4">
               <div className="flex items-start gap-3">
                 <CheckCircle2 className="h-5 w-5 shrink-0 text-emerald-600 dark:text-emerald-400 mt-0.5" />
-                <div className="text-sm">
+                <div className="text-sm space-y-1.5">
                   <div className="font-semibold text-emerald-900 dark:text-emerald-200">
-                    YouTube Publishing Package Prepared & Scheduled
+                    Video Uploaded to {publishResult.channelTitle || TARGET_CHANNEL_HANDLE}{' '}
+                    {publishResult.channelHandle ? `(${publishResult.channelHandle})` : ''}
                   </div>
-                  <p className="mt-1 text-emerald-800 dark:text-emerald-300">
-                    Scheduled for{' '}
-                    <span className="font-mono tabular-nums font-semibold">
-                      {publishResult.payload.scheduledDate}{' '}
-                      {publishResult.payload.scheduledTime}
-                    </span>{' '}
-                    ({publishResult.payload.timezone}) · Package ID:{' '}
-                    <span className="font-mono">{publishResult.publishId}</span>
+                  <p className="text-emerald-800 dark:text-emerald-300">
+                    Status: <span className="font-semibold">{publishResult.status}</span> · Video ID:{' '}
+                    <span className="font-mono">{publishResult.videoId || publishResult.publishId}</span>
                   </p>
+                  {publishResult.youtubeUrl && (
+                    <div className="flex flex-wrap items-center gap-4 pt-1">
+                      <a
+                        href={publishResult.youtubeUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1.5 font-semibold text-emerald-800 dark:text-emerald-200 underline hover:opacity-80"
+                      >
+                        <span>Watch on YouTube</span>
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </a>
+                      {publishResult.studioUrl && (
+                        <a
+                          href={publishResult.studioUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1.5 font-semibold text-emerald-800 dark:text-emerald-200 underline hover:opacity-80"
+                        >
+                          <span>Open in YouTube Studio</span>
+                          <ExternalLink className="h-3.5 w-3.5" />
+                        </a>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -493,7 +686,25 @@ export function ApprovalModal({
             <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
               {copy.schedulingTitle}
             </h3>
-            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              <div>
+                <label className="block text-xs font-medium text-slate-600 dark:text-slate-400">
+                  Visibility
+                </label>
+                <select
+                  value={privacyMode}
+                  onChange={(e) =>
+                    setPrivacyMode(e.target.value as YouTubePrivacyMode)
+                  }
+                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
+                >
+                  <option value="scheduled">Scheduled (Publish At)</option>
+                  <option value="public">Public (Immediate)</option>
+                  <option value="unlisted">Unlisted</option>
+                  <option value="private">Private Draft</option>
+                </select>
+              </div>
+
               <div>
                 <label className="flex items-center gap-1.5 text-xs font-medium text-slate-600 dark:text-slate-400">
                   <Calendar className="h-3.5 w-3.5" />
@@ -501,9 +712,10 @@ export function ApprovalModal({
                 </label>
                 <input
                   type="date"
+                  disabled={privacyMode !== 'scheduled'}
                   value={scheduledDate}
                   onChange={(e) => setScheduledDate(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm tabular-nums text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
+                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:opacity-50 px-3 py-2 text-sm tabular-nums text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
                 />
               </div>
 
@@ -514,9 +726,10 @@ export function ApprovalModal({
                 </label>
                 <input
                   type="time"
+                  disabled={privacyMode !== 'scheduled'}
                   value={scheduledTime}
                   onChange={(e) => setScheduledTime(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm tabular-nums text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
+                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:opacity-50 px-3 py-2 text-sm tabular-nums text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
                 />
               </div>
 
@@ -526,9 +739,10 @@ export function ApprovalModal({
                   <span>{copy.timezone}</span>
                 </label>
                 <select
+                  disabled={privacyMode !== 'scheduled'}
                   value={timezone}
                   onChange={(e) => setTimezone(e.target.value)}
-                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 px-3 py-2 text-sm text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
+                  className="mt-1.5 w-full rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-950 disabled:opacity-50 px-3 py-2 text-sm text-slate-900 dark:text-white focus:border-violet-600 focus:outline-none"
                 >
                   {TIMEZONES.map((tz) => (
                     <option key={tz} value={tz}>
@@ -638,10 +852,50 @@ export function ApprovalModal({
           )}
         </div>
 
+        {/* Explicit Upload Confirmation Dialog Banner (Mandatory before mutating YouTube account) */}
+        {confirmingUpload && metadata && (
+          <div className="border-t border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/60 px-6 py-4">
+            <div className="flex flex-wrap items-center justify-between gap-4">
+              <div className="text-sm text-amber-950 dark:text-amber-100">
+                <div className="font-bold">
+                  Confirm upload to YouTube channel{' '}
+                  {connectedChannel?.title || TARGET_CHANNEL_HANDLE}?
+                </div>
+                <p className="mt-0.5 text-xs text-amber-800 dark:text-amber-300">
+                  Title: &ldquo;{metadata.title}&rdquo; · Visibility:{' '}
+                  {privacyMode === 'scheduled'
+                    ? `Scheduled (${scheduledDate} ${scheduledTime} ${timezone})`
+                    : privacyMode}{' '}
+                  · Audience: Made for Kids (COPPA)
+                </p>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setConfirmingUpload(false)}
+                  className="rounded-lg border border-amber-300 dark:border-amber-700 bg-white dark:bg-slate-900 px-3.5 py-2 text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmUploadToYouTube}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 px-4 py-2 text-xs font-semibold text-white"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  <span>Confirm & Upload to YouTube</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Upload Footer Section */}
         <div className="flex flex-wrap items-center justify-between gap-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 px-6 py-4">
           <div className="text-xs text-slate-500 dark:text-slate-400">
-            Payload includes Title, Description, Tags, 15 Hashtags, Category, Thumbnail Prompt, Schedule & Video URL.
+            {uploading && uploadStage
+              ? uploadStage
+              : `Uploads video binary + SEO metadata directly to ${connectedChannel?.customUrl || TARGET_CHANNEL_HANDLE} via YouTube Data API v3.`}
           </div>
           <div className="flex items-center gap-3">
             <button
@@ -654,7 +908,7 @@ export function ApprovalModal({
             <button
               type="button"
               disabled={uploading || loadingMeta || !metadata}
-              onClick={handleUploadToYouTube}
+              onClick={handleRequestUpload}
               className="inline-flex items-center gap-2 rounded-lg bg-violet-700 hover:bg-violet-800 disabled:opacity-50 px-5 py-2.5 text-sm font-semibold text-white transition-colors whitespace-nowrap"
             >
               {uploading ? (

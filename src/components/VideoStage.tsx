@@ -14,7 +14,7 @@ import {
   Volume2,
 } from 'lucide-react';
 import type { GeneratedStory, VideoStatus } from '../types/story';
-import { renderStoryFrame } from '../lib/animationRenderer';
+import { preloadEnvironmentBackdrops, renderStoryFrame } from '../lib/animationRenderer';
 import type { UI_COPY } from '../lib/i18n';
 
 interface VideoStageProps {
@@ -83,6 +83,7 @@ export function VideoStage({
   // Animate preview canvas while Processing or when story exists without compiled blob
   useEffect(() => {
     if (!story || (videoUrl && status === 'Completed')) return;
+    void preloadEnvironmentBackdrops(story.scenes);
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');

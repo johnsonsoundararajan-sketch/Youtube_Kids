@@ -140,6 +140,17 @@ export interface YouTubeMetadata {
   publishingNotes: string;
 }
 
+export type YouTubePrivacyMode = 'scheduled' | 'public' | 'unlisted' | 'private';
+
+export interface YouTubeChannelInfo {
+  id: string;
+  title: string;
+  customUrl: string;
+  thumbnailUrl?: string;
+  subscriberCount?: string;
+  matchesTargetChannel: boolean;
+}
+
 export interface PublishPayload {
   title: string;
   description: string;
@@ -150,14 +161,20 @@ export interface PublishPayload {
   scheduledDate: string;
   scheduledTime: string;
   timezone?: string;
+  privacyMode?: YouTubePrivacyMode;
   videoUrl: string;
 }
 
 export interface PublishResult {
   publishId: string;
+  videoId?: string;
+  youtubeUrl?: string;
+  studioUrl?: string;
+  channelTitle?: string;
+  channelHandle?: string;
   publishedAt: string;
   scheduledIso: string;
-  status: 'Scheduled' | 'Ready';
+  status: 'Scheduled' | 'Uploaded' | 'Ready';
   payload: PublishPayload;
 }
 

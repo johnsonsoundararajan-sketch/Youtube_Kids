@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { CheckCircle2, Moon, Sun, Languages } from 'lucide-react';
+import { CheckCircle2, Moon, Sun, Languages, LogOut, ShieldCheck } from 'lucide-react';
 import { HeaderBar } from './components/HeaderBar';
 import { VideoStage } from './components/VideoStage';
 import { ApprovalModal } from './components/ApprovalModal';
 import { ScriptAndHistory } from './components/ScriptAndHistory';
+import { GoogleSignInButton } from './components/GoogleSignInButton';
+import {
+  fetchConnectedYouTubeChannel,
+  googleSignIn,
+  initAuth,
+  logout,
+  TARGET_CHANNEL_HANDLE,
+  TARGET_CHANNEL_URL,
+} from './lib/youtubeAuth';
 import { UI_COPY } from './lib/i18n';
 import {
   cacheProjectMedia,
@@ -28,6 +37,7 @@ import type {
   UILocale,
   VideoStatus,
   VoiceOption,
+  YouTubeChannelInfo,
   YouTubeMetadata,
 } from './types/story';
 
@@ -68,6 +78,13 @@ export default function App() {
   const [isApprovalOpen, setIsApprovalOpen] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // YouTube OAuth state (token kept strictly in memory)
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [connectedChannel, setConnectedChannel] =
+    useState<YouTubeChannelInfo | null>(null);
+  const [isSigningIn, setIsSigningIn] = useState<boolean>(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const narrationDataUrlRef = useRef<string | null>(null);
   const urlsRef = useRef<{
     video: string | null;
@@ -76,6 +93,25 @@ export default function App() {
   }>({ video: null, narration: null, music: null });
 
   const copy = UI_COPY[uiLocale];
+
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      async (_user, token) => {
+        setAccessToken(token);
+        try {
+          const ch = await fetchConnectedYouTubeChannel(token);
+          setConnectedChannel(ch);
+        } catch {
+          // Handled on explicit upload or sign-in
+        }
+      },
+      () => {
+        setAccessToken(null);
+        setConnectedChannel(null);
+      }
+    );
+    return () => unsubscribe();
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -373,8 +409,38 @@ export default function App() {
       return next;
     });
     showToast(
-      `YouTube upload package scheduled for ${result.payload.scheduledDate} at ${result.payload.scheduledTime}.`
+      result.videoId
+        ? `Uploaded to ${result.channelHandle || TARGET_CHANNEL_HANDLE} (Video ID: ${result.videoId}).`
+        : `YouTube upload package scheduled for ${result.payload.scheduledDate} at ${result.payload.scheduledTime}.`
     );
+  };
+
+  const handleGoogleSignIn = async () => {
+    setIsSigningIn(true);
+    setAuthError(null);
+    try {
+      const res = await googleSignIn();
+      if (res) {
+        setAccessToken(res.accessToken);
+        const ch = await fetchConnectedYouTubeChannel(res.accessToken);
+        setConnectedChannel(ch);
+        if (ch) {
+          showToast(`Connected YouTube channel: ${ch.title} (${ch.customUrl})`);
+        }
+      }
+    } catch (err) {
+      setAuthError(
+        err instanceof Error ? err.message : 'Google sign-in failed.'
+      );
+    } finally {
+      setIsSigningIn(false);
+    }
+  };
+
+  const handleGoogleLogout = async () => {
+    await logout();
+    setAccessToken(null);
+    setConnectedChannel(null);
   };
 
   const handleNavigate = (section: 'studio' | 'script' | 'history') => {
@@ -516,6 +582,64 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          {/* YouTube Channel Connection Strip */}
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 dark:border-slate-800 pt-3.5">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+              <span>YouTube Upload Target:</span>
+              <a
+                href={TARGET_CHANNEL_URL}
+                target="_blank"
+                rel="noreferrer"
+                className="font-semibold text-violet-700 dark:text-violet-400 hover:underline"
+              >
+                {TARGET_CHANNEL_HANDLE}
+              </a>
+              {connectedChannel && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span className="inline-flex items-center gap-1.5 font-medium text-slate-900 dark:text-white">
+                    {connectedChannel.matchesTargetChannel && (
+                      <ShieldCheck className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400" />
+                    )}
+                    Connected: {connectedChannel.title} ({connectedChannel.customUrl})
+                  </span>
+                </>
+              )}
+              {authError && (
+                <span className="text-rose-600 dark:text-rose-400">
+                  · {authError}
+                </span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              {accessToken ? (
+                <>
+                  <GoogleSignInButton
+                    onClick={handleGoogleSignIn}
+                    loading={isSigningIn}
+                    label="Switch Channel"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleGoogleLogout}
+                    aria-label="Sign out of Google"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 dark:border-slate-700 px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    <span>Sign out</span>
+                  </button>
+                </>
+              ) : (
+                <GoogleSignInButton
+                  onClick={handleGoogleSignIn}
+                  loading={isSigningIn}
+                  label="Sign in with Google"
+                />
+              )}
+            </div>
+          </div>
         </section>
 
         {/* CENTER SECTION: Video Player & Metadata */}
@@ -567,6 +691,11 @@ export default function App() {
           durationSeconds={durationSeconds}
           videoUrl={videoUrl}
           initialMetadata={activeRecord?.youtubeMetadata}
+          accessToken={accessToken}
+          connectedChannel={connectedChannel}
+          isSigningIn={isSigningIn}
+          authError={authError}
+          onGoogleSignIn={handleGoogleSignIn}
           copy={copy}
           onClose={() => setIsApprovalOpen(false)}
           onMetadataReady={handleMetadataReady}
