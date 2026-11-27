@@ -15,6 +15,10 @@ import {
 } from 'lucide-react';
 import type { GeneratedStory, VideoStatus } from '../types/story';
 import { preloadEnvironmentBackdrops, renderStoryFrame } from '../lib/animationRenderer';
+import {
+  generateSceneIllustrations,
+  renderImageSlideshowFrame,
+} from '../lib/imageStoryRenderer';
 import type { UI_COPY } from '../lib/i18n';
 
 interface VideoStageProps {
@@ -31,6 +35,7 @@ interface VideoStageProps {
   copy: (typeof UI_COPY)['en'];
   onRegenerateStory: () => void;
   onRegenerateVideo: () => void;
+  onContinueMusicOnly?: () => void;
   onDownloadScript: () => void;
 }
 
@@ -72,6 +77,7 @@ export function VideoStage({
   copy,
   onRegenerateStory,
   onRegenerateVideo,
+  onContinueMusicOnly,
   onDownloadScript,
 }: VideoStageProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -83,30 +89,43 @@ export function VideoStage({
   // Animate preview canvas while Processing or when story exists without compiled blob
   useEffect(() => {
     if (!story || (videoUrl && status === 'Completed')) return;
-    void preloadEnvironmentBackdrops(story.scenes);
+    let cancelled = false;
+    let rafId = 0;
+    const start = performance.now();
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let rafId = 0;
-    const start = performance.now();
-
-    const loop = () => {
-      const elapsed = ((performance.now() - start) / 1000) % Math.max(18, story.estimatedDurationSec);
-      const amp = 0.25 + Math.abs(Math.sin(elapsed * 4.2)) * 0.45;
-      renderStoryFrame(
-        ctx,
-        story,
-        elapsed,
-        Math.max(18, story.estimatedDurationSec),
-        amp
-      );
+    if (story.videoMode === 'image_slideshow') {
+      void generateSceneIllustrations(story).then((plates) => {
+        if (cancelled) return;
+        const loop = () => {
+          if (cancelled) return;
+          const dur = Math.max(18, story.estimatedDurationSec);
+          const elapsed = ((performance.now() - start) / 1000) % dur;
+          renderImageSlideshowFrame(ctx, story, plates, elapsed, dur);
+          rafId = requestAnimationFrame(loop);
+        };
+        rafId = requestAnimationFrame(loop);
+      });
+    } else {
+      void preloadEnvironmentBackdrops(story.scenes);
+      const loop = () => {
+        if (cancelled) return;
+        const dur = Math.max(18, story.estimatedDurationSec);
+        const elapsed = ((performance.now() - start) / 1000) % dur;
+        const amp = 0.25 + Math.abs(Math.sin(elapsed * 4.2)) * 0.45;
+        renderStoryFrame(ctx, story, elapsed, dur, amp);
+        rafId = requestAnimationFrame(loop);
+      };
       rafId = requestAnimationFrame(loop);
-    };
+    }
 
-    rafId = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafId);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafId);
+    };
   }, [story, videoUrl, status]);
 
   useEffect(() => {
@@ -239,6 +258,20 @@ export function VideoStage({
                   <p className="mt-1 text-sm text-slate-300 leading-relaxed">
                     {errorMessage}
                   </p>
+                  {story &&
+                    onContinueMusicOnly &&
+                    (errorMessage.includes('429') ||
+                      errorMessage.toLowerCase().includes('rate limit') ||
+                      errorMessage.toLowerCase().includes('quota')) && (
+                      <button
+                        type="button"
+                        onClick={onContinueMusicOnly}
+                        className="mt-3 inline-flex items-center gap-2 rounded-lg bg-violet-600 hover:bg-violet-700 px-3.5 py-2 text-xs font-semibold text-white transition-colors"
+                      >
+                        <Music className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Render Story with Music Only (Skip Voice)</span>
+                      </button>
+                    )}
                 </div>
               </div>
             </div>
@@ -390,8 +423,20 @@ export function VideoStage({
             <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
               {copy.languageLabel} / {copy.durationLabel}
             </div>
-            <div className="mt-1 flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
               <span>{story?.language || '—'}</span>
+              {story && (
+                <>
+                  <span aria-hidden="true" className="text-slate-400">
+                    ·
+                  </span>
+                  <span className="text-xs font-medium text-violet-700 dark:text-violet-400">
+                    {story.videoMode === 'image_slideshow'
+                      ? copy.imageStoryModeLabel
+                      : copy.animatedModeLabel}
+                  </span>
+                </>
+              )}
               <span aria-hidden="true" className="text-slate-400">
                 ·
               </span>

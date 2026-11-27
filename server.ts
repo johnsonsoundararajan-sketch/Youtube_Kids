@@ -47,6 +47,15 @@ function getBetaAiClient(): GoogleGenAI {
   });
 }
 
+function isDailyQuotaExhausted(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('per day') ||
+    lower.includes('free tier') ||
+    lower.includes('too_many_requests')
+  );
+}
+
 async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -55,6 +64,9 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
     } catch (err: unknown) {
       lastError = err;
       const message = err instanceof Error ? err.message : String(err);
+      if (isDailyQuotaExhausted(message)) {
+        throw err;
+      }
       const isTransient =
         message.includes('429') ||
         message.includes('503') ||
@@ -67,6 +79,146 @@ async function withRetry<T>(fn: () => Promise<T>, maxAttempts = 3): Promise<T> {
     }
   }
   throw lastError;
+}
+
+const SERVER_NAMED_COLORS: Record<string, string> = {
+  silver_blue: '#93C5FD',
+  sky_blue: '#38BDF8',
+  light_blue: '#60A5FA',
+  royal_blue: '#2563EB',
+  navy_blue: '#1E3A8A',
+  blue: '#3B82F6',
+  golden_yellow: '#F59E0B',
+  gold: '#F59E0B',
+  amber: '#D97706',
+  yellow: '#FACC15',
+  brown: '#92400E',
+  cream: '#FEF3C7',
+  white: '#F8FAFC',
+  silver: '#CBD5E1',
+  green: '#22C55E',
+  emerald: '#10B981',
+  teal: '#0D9488',
+  red: '#EF4444',
+  coral: '#FB7185',
+  pink: '#EC4899',
+  orange: '#EA580C',
+  purple: '#8B5CF6',
+  violet: '#7C3AED',
+  indigo: '#4F46E5',
+};
+
+function sanitizeHexColor(raw: unknown, fallback = '#3B82F6'): string {
+  if (typeof raw !== 'string') return fallback;
+  const trimmed = raw.trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(trimmed)) return trimmed;
+  if (/^#[0-9a-fA-F]{3}$/.test(trimmed)) {
+    return `#${trimmed[1]}${trimmed[1]}${trimmed[2]}${trimmed[2]}${trimmed[3]}${trimmed[3]}`;
+  }
+  const key = trimmed.toLowerCase().replace(/[\s-]+/g, '_');
+  if (SERVER_NAMED_COLORS[key]) return SERVER_NAMED_COLORS[key];
+  for (const [k, hex] of Object.entries(SERVER_NAMED_COLORS)) {
+    if (key.includes(k)) return hex;
+  }
+  return fallback;
+}
+
+function detectSceneTimingsFromPcm(
+  pcm: Buffer,
+  sampleRate: number,
+  channels: number,
+  bitsPerSample: number,
+  sceneInputs: Array<{ sceneNumber: number; text: string }>
+): Array<{
+  sceneNumber: number;
+  duration: number;
+  audioStartSec: number;
+  audioEndSec: number;
+}> {
+  const bytesPerSample = Math.max(1, bitsPerSample / 8);
+  const bytesPerFrame = sampleRate * channels * bytesPerSample;
+  const totalSec = Math.max(1, pcm.length / bytesPerFrame);
+
+  if (sceneInputs.length <= 1) {
+    return [
+      {
+        sceneNumber: sceneInputs[0]?.sceneNumber ?? 1,
+        duration: Math.round(totalSec * 1000) / 1000,
+        audioStartSec: 0,
+        audioEndSec: Math.round(totalSec * 1000) / 1000,
+      },
+    ];
+  }
+
+  // Compute 40ms RMS energy envelope across the synthesized WAV
+  const stepSec = 0.04;
+  const stepSamples = Math.max(1, Math.floor(sampleRate * stepSec));
+  const numWindows = Math.max(1, Math.floor(pcm.length / (stepSamples * channels * bytesPerSample)));
+  const rmsEnvelope = new Float32Array(numWindows);
+
+  for (let w = 0; w < numWindows; w++) {
+    const startByte = w * stepSamples * channels * bytesPerSample;
+    const endByte = Math.min(pcm.length - 1, startByte + stepSamples * channels * bytesPerSample);
+    let sumSq = 0;
+    let count = 0;
+    for (let b = startByte; b + 1 < endByte; b += channels * 2) {
+      const sample = pcm.readInt16LE(b) / 32768;
+      sumSq += sample * sample;
+      count++;
+    }
+    rmsEnvelope[w] = count > 0 ? Math.sqrt(sumSq / count) : 0;
+  }
+
+  // Proportional spoken character weight per scene
+  const weights = sceneInputs.map((s) => Math.max(12, s.text.length));
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
+
+  const boundaries: number[] = [0];
+  let cumWeight = 0;
+  const avgSceneSec = totalSec / sceneInputs.length;
+
+  for (let i = 0; i < sceneInputs.length - 1; i++) {
+    cumWeight += weights[i];
+    const targetSec = (cumWeight / totalWeight) * totalSec;
+    const prevBound = boundaries[boundaries.length - 1];
+    const searchRadius = Math.min(3.5, avgSceneSec * 0.36);
+    const minSec = Math.max(prevBound + 1.5, targetSec - searchRadius);
+    const maxSec = Math.min(totalSec - (sceneInputs.length - 1 - i) * 1.5, targetSec + searchRadius);
+
+    const minWin = Math.max(0, Math.floor(minSec / stepSec));
+    const maxWin = Math.min(numWindows - 1, Math.ceil(maxSec / stepSec));
+
+    let bestSec = targetSec;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let w = minWin; w <= maxWin; w++) {
+      // Average 3 adjacent 40ms windows (120ms pause valley)
+      const ePrev = rmsEnvelope[Math.max(0, w - 1)];
+      const eCurr = rmsEnvelope[w];
+      const eNext = rmsEnvelope[Math.min(numWindows - 1, w + 1)];
+      const valleyEnergy = (ePrev + eCurr + eNext) / 3;
+      const distPenalty = Math.abs(w * stepSec - targetSec) * 0.008;
+      const score = valleyEnergy + distPenalty;
+      if (score < bestScore) {
+        bestScore = score;
+        bestSec = w * stepSec + stepSec * 0.5;
+      }
+    }
+
+    boundaries.push(Math.round(bestSec * 1000) / 1000);
+  }
+  boundaries.push(Math.round(totalSec * 1000) / 1000);
+
+  return sceneInputs.map((s, idx) => {
+    const audioStartSec = boundaries[idx];
+    const audioEndSec = boundaries[idx + 1];
+    return {
+      sceneNumber: s.sceneNumber,
+      duration: Math.max(0.5, Math.round((audioEndSec - audioStartSec) * 1000) / 1000),
+      audioStartSec,
+      audioEndSec,
+    };
+  });
 }
 
 function splitScriptIntoChunks(text: string, maxChars = 750): string[] {
@@ -232,14 +384,16 @@ async function createServer() {
         voiceOption = 'Cute Narrator',
         theme = '',
         previousTitle = '',
+        mode = 'animated',
       } = req.body ?? {};
 
+      const videoMode = mode === 'image_slideshow' ? 'image_slideshow' : 'animated';
       const ai = getAiClient();
       const targetLanguage = language === 'Tamil' ? 'Tamil' : 'English';
       const languageDirective =
         targetLanguage === 'Tamil'
-          ? 'Write the title, bibleReference, moralLesson, subtitleCaption, and every narrationSegment in natural, warm, kid-friendly TAMIL script (தமிழ்) suitable for children ages 4-10. Keep JSON keys, enum fields (environment, timeOfDay, weatherEffect, cameraMove, transitionIn, kind, action, mood, key), and primaryColor hex codes in English.'
-          : 'Write the title, bibleReference, moralLesson, subtitleCaption, and every narrationSegment in simple, warm, engaging English suitable for children ages 4-10.';
+          ? 'Write the title, bibleReference, moralLesson, subtitleCaption, and every scene narration in natural, warm, kid-friendly TAMIL script (தமிழ்) suitable for children ages 4-10. Write every scene imagePrompt in clear, vivid ENGLISH illustration language directly depicting that scene narration. Keep JSON keys, enum fields (environment, timeOfDay, weatherEffect, cameraMove, transitionIn, scenicFocus, storyProps, kind, action, mood, key), and primaryColor hex codes in English.'
+          : 'Write the title, bibleReference, moralLesson, subtitleCaption, every scene narration, and every scene imagePrompt in simple, warm, vivid English suitable for children ages 4-10.';
 
       const themeDirective = theme
         ? `Story focus or theme requested: "${theme}".`
@@ -249,13 +403,24 @@ async function createServer() {
         ? `Do NOT repeat "${previousTitle}". Choose a completely different Bible story and characters.`
         : '';
 
+      const modeDirective =
+        videoMode === 'image_slideshow'
+          ? `- IMAGE STORY MODE (Exact Storybook Scene Illustrations From Narration):
+  * Each scene stores narration, imagePrompt, and duration together.
+  * Write each scene's "imagePrompt" DIRECTLY from that scene's "narration", describing the EXACT story illustration (all characters, animals, objects, clothing, poses, actions, setting, and warm storybook lighting mentioned in that scene's narration — NEVER just an empty background).
+  * Populate "characters" with the exact people/animals present in that scene's narration (with startX equal to endX and calm storybook poses like listening, praying, celebrating, waving, flying, or swimming) so the static illustration depicts the exact storyline.
+  * Populate "scenicFocus" and "storyProps" with every matching story object (e.g., rainbow_arc, wooden_ark, fishing_boat, glowing_star, loaves_and_fish, golden_harp, manger_cradle, sycamore_tree, stone_well, lions_den, shepherd_hills, stone_bridge, olive_tree, flower_arch, lantern_village, desert_palms, mountain_sunrise).`
+          : `- Character acting rules: Keep characters grounded like actors in a feature film. Use "walking" ONLY when a character physically walks from one spot to another (startX != endX). Keep startX equal to endX during conversations, teaching, or listening, using "listening", "praying", or calm "celebrating" / brief "waving". Avoid "jumping" for human characters. Set scenicFocus and storyProps to match the storyline.
+- Store each scene's "narration", "imagePrompt" (generated directly from that scene's narration), and estimated "duration" (in seconds, ~12-22s per scene) together in each scene object.`;
+
       const prompt = `
-Create an original, heartwarming animated children's Bible story video script for ages 4 to 10.
+Create an original, heartwarming children's Bible story video script for ages 4 to 10.
 Requirements:
 - Based faithfully on Bible teachings with a positive, clear moral lesson.
-- 2 to 3 minutes total narration length (about 280 to 360 spoken words total across 8 animated scenes).
-- Simple, vivid, joyful language with fun memorable characters (children, Bible figures, and friendly animals) and a happy ending.
-- Structure into exactly 8 continuous animated scenes (around 35-45 words per scene) so every scene flows smoothly into the next with character movement, camera movement, and rich environmental animation.
+- 2 to 3 minutes total narration length (about 280 to 360 spoken words total across 8 scenes).
+- Simple, vivid, joyful language with memorable storytelling and a happy ending.
+- Structure into exactly 8 continuous scenes (around 35-45 words per scene) so every scene flows smoothly into the next with natural film-like pacing and camera framing.
+${modeDirective}
 - ${themeDirective}
 - ${avoidRepeat}
 - ${languageDirective}
@@ -267,7 +432,9 @@ Requirements:
           contents: prompt,
           config: {
             systemInstruction:
-              'You are an award-winning children Bible animated film writer and storyboard director. Output clean valid JSON strictly matching the schema.',
+              videoMode === 'image_slideshow'
+                ? 'You are an award-winning children Bible storybook writer and illustration director. Every scene must bundle narration, an exact matching imagePrompt derived directly from that narration, matching characters & storyProps, and duration. Output clean valid JSON strictly matching the schema.'
+                : 'You are an award-winning children Bible animated film writer and storyboard director. Output clean valid JSON strictly matching the schema.',
             responseMimeType: 'application/json',
             responseSchema: {
               type: Type.OBJECT,
@@ -301,7 +468,9 @@ Requirements:
                     properties: {
                       sceneNumber: { type: Type.INTEGER },
                       title: { type: Type.STRING },
-                      narrationSegment: { type: Type.STRING },
+                      narration: { type: Type.STRING },
+                      imagePrompt: { type: Type.STRING },
+                      duration: { type: Type.NUMBER },
                       subtitleCaption: { type: Type.STRING },
                       environment: {
                         type: Type.STRING,
@@ -356,6 +525,54 @@ Requirements:
                           'wipe_horizon',
                           'sunburst',
                         ],
+                      },
+                      scenicFocus: {
+                        type: Type.STRING,
+                        enum: [
+                          'none',
+                          'rainbow_arc',
+                          'wooden_ark',
+                          'fishing_boat',
+                          'glowing_star',
+                          'shepherd_hills',
+                          'stone_bridge',
+                          'olive_tree',
+                          'flower_arch',
+                          'lantern_village',
+                          'desert_palms',
+                          'mountain_sunrise',
+                          'loaves_and_fish',
+                          'golden_harp',
+                          'manger_cradle',
+                          'sycamore_tree',
+                          'stone_well',
+                          'lions_den',
+                        ],
+                      },
+                      storyProps: {
+                        type: Type.ARRAY,
+                        items: {
+                          type: Type.STRING,
+                          enum: [
+                            'rainbow_arc',
+                            'wooden_ark',
+                            'fishing_boat',
+                            'glowing_star',
+                            'shepherd_hills',
+                            'stone_bridge',
+                            'olive_tree',
+                            'flower_arch',
+                            'lantern_village',
+                            'desert_palms',
+                            'mountain_sunrise',
+                            'loaves_and_fish',
+                            'golden_harp',
+                            'manger_cradle',
+                            'sycamore_tree',
+                            'stone_well',
+                            'lions_den',
+                          ],
+                        },
                       },
                       characters: {
                         type: Type.ARRAY,
@@ -420,13 +637,17 @@ Requirements:
                     required: [
                       'sceneNumber',
                       'title',
-                      'narrationSegment',
+                      'narration',
+                      'imagePrompt',
+                      'duration',
                       'subtitleCaption',
                       'environment',
                       'timeOfDay',
                       'weatherEffect',
                       'cameraMove',
                       'transitionIn',
+                      'scenicFocus',
+                      'storyProps',
                       'characters',
                     ],
                   },
@@ -446,14 +667,52 @@ Requirements:
 
       const raw = (response.text ?? '{}').trim();
       const parsed = JSON.parse(raw);
-      const scenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+      const rawScenes = Array.isArray(parsed.scenes) ? parsed.scenes : [];
+      const scenes = rawScenes.map((s: Record<string, unknown>, idx: number) => {
+        const narrationText = String(s.narration ?? s.narrationSegment ?? '').trim();
+        const promptText = String(s.imagePrompt ?? s.visualDescription ?? narrationText).trim();
+        const wordCountScene = narrationText.split(/\s+/).filter(Boolean).length;
+        const estimatedSceneDur =
+          typeof s.duration === 'number' && Number.isFinite(s.duration) && s.duration > 2
+            ? Math.round(s.duration * 10) / 10
+            : Math.max(6, Math.round(((wordCountScene / 130) * 60) * 10) / 10);
+        const chars = Array.isArray(s.characters) ? s.characters : [];
+        const normalizedChars = chars.map((c: Record<string, unknown>) => ({
+          ...c,
+          primaryColor: sanitizeHexColor(c.primaryColor, '#3B82F6'),
+          endX:
+            videoMode === 'image_slideshow'
+              ? typeof c.startX === 'number'
+                ? c.startX
+                : 0.5
+              : c.endX,
+        }));
+
+        return {
+          ...s,
+          sceneNumber: Number(s.sceneNumber) || idx + 1,
+          narration: narrationText,
+          narrationSegment: narrationText,
+          imagePrompt: promptText,
+          visualDescription: promptText,
+          duration: estimatedSceneDur,
+          characters: normalizedChars,
+        };
+      });
+
       const narrationScript = scenes
-        .map((s: { narrationSegment?: string }) => s.narrationSegment ?? '')
+        .map((s: { narration: string }) => s.narration)
         .filter(Boolean)
         .join('\n\n');
 
-      const wordCount = narrationScript.split(/\s+/).filter(Boolean).length;
-      const estimatedDurationSec = Math.max(95, Math.round((wordCount / 130) * 60));
+      const totalEstimated = scenes.reduce(
+        (acc: number, s: { duration: number }) => acc + (s.duration || 12),
+        0
+      );
+      const estimatedDurationSec = Math.max(
+        60,
+        Math.round(totalEstimated + 3.4)
+      );
 
       res.json({
         id: `story_${Date.now()}`,
@@ -464,6 +723,7 @@ Requirements:
         language: targetLanguage,
         voiceOption,
         theme,
+        videoMode,
         scenes,
         musicProfile: parsed.musicProfile ?? {
           key: 'C_major',
@@ -481,39 +741,77 @@ Requirements:
     }
   });
 
+  interface CachedTtsPayload {
+    audioDataUrl: string;
+    durationSeconds: number;
+    chunksCount: number;
+    voiceName: string;
+    modelUsed: string;
+    sceneTimings: Array<{
+      sceneNumber: number;
+      duration: number;
+      audioStartSec: number;
+      audioEndSec: number;
+    }>;
+  }
+  const ttsCache = new Map<string, CachedTtsPayload>();
+
   app.post('/api/voice/synthesize', async (req: Request, res: Response) => {
     try {
       const {
         text,
+        scenes,
         voiceOption = 'Cute Narrator',
         language = 'English',
         isPreview = false,
       } = req.body ?? {};
 
-      if (!text || typeof text !== 'string' || !text.trim()) {
-        res.status(400).json({ error: 'Narration text is required.' });
+      const sceneInputs =
+        !isPreview && Array.isArray(scenes)
+          ? scenes
+              .map((s: Record<string, unknown>, idx: number) => ({
+                sceneNumber: Number(s?.sceneNumber) || idx + 1,
+                text: String(s?.narration ?? s?.narrationSegment ?? '').trim(),
+              }))
+              .filter((s) => s.text.length > 0)
+          : [];
+
+      const combinedText =
+        sceneInputs.length > 0
+          ? sceneInputs.map((s) => s.text).join('\n\n')
+          : String(text || '').trim();
+
+      if (!combinedText) {
+        res.status(400).json({ error: 'Narration text or scenes are required.' });
         return;
       }
 
-      const ai = getBetaAiClient();
       const { voiceName, style } = getVoiceConfig(voiceOption);
-      const chunks = isPreview
-        ? [text.trim().slice(0, 600)]
-        : splitScriptIntoChunks(text, 750);
+      const cacheKey = crypto
+        .createHash('sha256')
+        .update(`${language}|${voiceName}|${isPreview}|${combinedText}`)
+        .digest('hex');
 
-      const pcmBuffers: Buffer[] = [];
-      let sampleRate = 24000;
-      let channels = 1;
-      let bitsPerSample = 16;
+      const cached = ttsCache.get(cacheKey);
+      if (cached) {
+        res.json(cached);
+        return;
+      }
 
-      for (const chunk of chunks) {
+      const betaAi = getBetaAiClient();
+      let modelUsed = 'gemini-3.8-flash-lite-tts';
+
+      const synthesizeWithModel = async (
+        modelName: 'gemini-3.8-flash-lite-tts' | 'gemini-3.8-flash-tts',
+        chunkText: string
+      ) => {
         const ttsInteraction = await withRetry(() =>
-          ai.interactions.create({
-            model: 'gemini-3.8-flash-lite-tts',
+          betaAi.interactions.create({
+            model: modelName,
             input: [
               {
                 type: 'text',
-                text: chunk,
+                text: chunkText,
                 annotations: [
                   {
                     type: 'speech_metadata',
@@ -543,43 +841,119 @@ Requirements:
         if (!base64Audio) {
           throw new Error('Gemini TTS did not return audio data.');
         }
+        return extractPcmFromWav(Buffer.from(base64Audio, 'base64'));
+      };
 
-        const chunkBuffer = Buffer.from(base64Audio, 'base64');
-        const extracted = extractPcmFromWav(chunkBuffer);
+      const synthesizeChunkWithFallback = async (chunkText: string) => {
+        // 1. Primary: gemini-3.8-flash-lite-tts (1 request per full story up to 3200 chars)
+        try {
+          modelUsed = 'gemini-3.8-flash-lite-tts';
+          return await synthesizeWithModel('gemini-3.8-flash-lite-tts', chunkText);
+        } catch (primaryErr: unknown) {
+          const primaryMsg =
+            primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+          const isQuotaErr =
+            primaryMsg.includes('429') ||
+            primaryMsg.includes('RESOURCE_EXHAUSTED') ||
+            primaryMsg.includes('too_many_requests');
+
+          if (!isQuotaErr) {
+            throw primaryErr;
+          }
+
+          // 2. Fallback: gemini-3.8-flash-tts via v1beta Interactions API
+          try {
+            modelUsed = 'gemini-3.8-flash-tts';
+            return await synthesizeWithModel('gemini-3.8-flash-tts', chunkText);
+          } catch (fallbackErr: unknown) {
+            const fallbackMsg =
+              fallbackErr instanceof Error
+                ? fallbackErr.message
+                : String(fallbackErr);
+            if (
+              fallbackMsg.includes('429') ||
+              fallbackMsg.includes('RESOURCE_EXHAUSTED') ||
+              fallbackMsg.includes('too_many_requests')
+            ) {
+              throw fallbackErr;
+            }
+            throw primaryErr;
+          }
+        }
+      };
+
+      // Use large 3200-char chunks so an entire 8-scene Bible story completes in 1 single TTS call
+      const chunks = isPreview
+        ? [combinedText.slice(0, 600)]
+        : splitScriptIntoChunks(combinedText, 3200);
+
+      const pcmBuffers: Buffer[] = [];
+      let sampleRate = 24000;
+      let channels = 1;
+      let bitsPerSample = 16;
+
+      for (let i = 0; i < chunks.length; i++) {
+        const extracted = await synthesizeChunkWithFallback(chunks[i]);
         sampleRate = extracted.sampleRate;
         channels = extracted.channels;
         bitsPerSample = extracted.bitsPerSample;
         pcmBuffers.push(extracted.pcm);
 
-        // Short 220ms pause between story paragraphs
-        if (!isPreview) {
-          const pauseSamples = Math.floor(sampleRate * 0.22);
+        if (!isPreview && i < chunks.length - 1) {
+          const pauseSamples = Math.floor(sampleRate * 0.25);
           const pauseBytes = pauseSamples * channels * (bitsPerSample / 8);
           pcmBuffers.push(Buffer.alloc(pauseBytes));
         }
       }
 
+      const fullPcm = Buffer.concat(pcmBuffers);
+      const sceneTimings =
+        sceneInputs.length > 0
+          ? detectSceneTimingsFromPcm(
+              fullPcm,
+              sampleRate,
+              channels,
+              bitsPerSample,
+              sceneInputs
+            )
+          : [];
+
       const combinedWav = buildWavBuffer(
-        pcmBuffers,
+        [fullPcm],
         sampleRate,
         channels,
         bitsPerSample
       );
       const bytesPerSecond = sampleRate * channels * (bitsPerSample / 8);
-      const totalPcmBytes = pcmBuffers.reduce((sum, b) => sum + b.length, 0);
-      const durationSeconds = Math.max(1, totalPcmBytes / bytesPerSecond);
+      const durationSeconds = Math.max(1, fullPcm.length / bytesPerSecond);
 
-      res.json({
+      const payload: CachedTtsPayload = {
         audioDataUrl: `data:audio/wav;base64,${combinedWav.toString('base64')}`,
         durationSeconds,
         chunksCount: chunks.length,
         voiceName,
-      });
+        modelUsed,
+        sceneTimings,
+      };
+
+      if (ttsCache.size >= 20) {
+        const oldestKey = ttsCache.keys().next().value;
+        if (oldestKey) ttsCache.delete(oldestKey);
+      }
+      ttsCache.set(cacheKey, payload);
+
+      res.json(payload);
     } catch (error: unknown) {
       console.error('Voice synthesis error:', error);
       const message =
         error instanceof Error ? error.message : 'Failed to synthesize voice.';
-      res.status(500).json({ error: message });
+      const status =
+        message.includes('429') ||
+        message.includes('too_many_requests') ||
+        message.includes('RESOURCE_EXHAUSTED')
+          ? 429
+          : 500;
+      res.status(status).json({ error: message });
     }
   });
 

@@ -83,6 +83,28 @@ export type CharacterMood =
   | 'brave'
   | 'joyful';
 
+export type StoryVideoMode = 'animated' | 'image_slideshow';
+
+export type ScenicFocus =
+  | 'none'
+  | 'rainbow_arc'
+  | 'wooden_ark'
+  | 'fishing_boat'
+  | 'glowing_star'
+  | 'shepherd_hills'
+  | 'stone_bridge'
+  | 'olive_tree'
+  | 'flower_arch'
+  | 'lantern_village'
+  | 'desert_palms'
+  | 'mountain_sunrise'
+  | 'loaves_and_fish'
+  | 'golden_harp'
+  | 'manger_cradle'
+  | 'sycamore_tree'
+  | 'stone_well'
+  | 'lions_den';
+
 export interface SceneCharacter {
   name: string;
   kind: SceneCharacterKind;
@@ -93,16 +115,31 @@ export interface SceneCharacter {
   endX: number;
 }
 
+export interface SceneAudioTiming {
+  sceneNumber: number;
+  duration: number;
+  audioStartSec: number;
+  audioEndSec: number;
+}
+
 export interface StoryScene {
   sceneNumber: number;
   title: string;
+  narration: string;
   narrationSegment: string;
+  imagePrompt: string;
+  duration: number;
+  startTimeSec?: number;
+  endTimeSec?: number;
   subtitleCaption: string;
   environment: SceneEnvironment;
   timeOfDay: TimeOfDay;
   weatherEffect: WeatherEffect;
   cameraMove: CameraMove;
   transitionIn: TransitionType;
+  scenicFocus?: ScenicFocus;
+  storyProps?: ScenicFocus[];
+  visualDescription?: string;
   characters: SceneCharacter[];
 }
 
@@ -121,6 +158,7 @@ export interface GeneratedStory {
   language: StoryLanguage;
   voiceOption: VoiceOption;
   theme?: string;
+  videoMode?: StoryVideoMode;
   scenes: StoryScene[];
   musicProfile: MusicProfile;
   createdAt: string;

@@ -25,15 +25,22 @@ import {
 } from './lib/storage';
 import {
   computeAmplitudeTimeline,
+  createSilentNarrationTrack,
   decodeAudioDataUrl,
   generateBalancedSoundtrack,
 } from './lib/musicEngine';
 import { renderAnimatedVideo } from './lib/animationRenderer';
+import {
+  generateSceneIllustrations,
+  renderSlideshowVideo,
+} from './lib/imageStoryRenderer';
 import type {
   GeneratedStory,
   PublishResult,
+  SceneAudioTiming,
   StoryLanguage,
   StoryProjectRecord,
+  StoryVideoMode,
   UILocale,
   VideoStatus,
   VoiceOption,
@@ -60,6 +67,8 @@ export default function App() {
   >('studio');
 
   const [story, setStory] = useState<GeneratedStory | null>(null);
+  const [activeGenerationMode, setActiveGenerationMode] =
+    useState<StoryVideoMode | null>(null);
   const [status, setStatus] = useState<VideoStatus>('Idle');
   const [stageLabel, setStageLabel] = useState<string>('');
   const [progress, setProgress] = useState<number>(0);
@@ -86,6 +95,7 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const narrationDataUrlRef = useRef<string | null>(null);
+  const sceneTimingsRef = useRef<SceneAudioTiming[] | null>(null);
   const urlsRef = useRef<{
     video: string | null;
     narration: string | null;
@@ -166,47 +176,147 @@ export default function App() {
   );
 
   const compileAudioAndVideoFromStory = useCallback(
-    async (targetStory: GeneratedStory, existingNarrationDataUrl?: string | null) => {
+    async (
+      targetStory: GeneratedStory,
+      existingNarrationDataUrl?: string | null,
+      musicOnlyFallback = false
+    ) => {
+      const isImageStory = targetStory.videoMode === 'image_slideshow';
       setErrorMessage(null);
       setStatus('Generating');
-      setStageLabel(
-        `Recording ${targetStory.voiceOption} narration in ${targetStory.language}...`
-      );
-      setProgress(28);
 
-      let narDataUrl = existingNarrationDataUrl || null;
-      if (!narDataUrl) {
-        const ttsRes = await fetch('/api/voice/synthesize', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: targetStory.narrationScript,
-            voiceOption: targetStory.voiceOption,
-            language: targetStory.language,
-            isPreview: false,
-          }),
+      let narrationBuffer: AudioBuffer;
+      let narrationBlob: Blob;
+      let measuredTimings: SceneAudioTiming[] | null = existingNarrationDataUrl
+        ? sceneTimingsRef.current
+        : null;
+
+      if (musicOnlyFallback) {
+        setStageLabel('Preparing music-only soundtrack for story scenes...');
+        setProgress(30);
+        let cursor = 0;
+        measuredTimings = targetStory.scenes.map((scene) => {
+          const dur = Math.max(4, scene.duration || 12);
+          const start = cursor;
+          const end = cursor + dur;
+          cursor = end;
+          return {
+            sceneNumber: scene.sceneNumber,
+            duration: dur,
+            audioStartSec: Math.round(start * 1000) / 1000,
+            audioEndSec: Math.round(end * 1000) / 1000,
+          };
         });
-        const ttsJson = await ttsRes.json();
-        if (!ttsRes.ok) {
-          throw new Error(ttsJson.error || 'Voice synthesis failed.');
+        const silent = createSilentNarrationTrack(Math.max(18, cursor));
+        narrationBuffer = silent.buffer;
+        narrationBlob = silent.blob;
+      } else {
+        setStageLabel(
+          `Recording ${targetStory.voiceOption} narration in ${targetStory.language}...`
+        );
+        setProgress(24);
+
+        let narDataUrl = existingNarrationDataUrl || null;
+
+        if (!narDataUrl) {
+          const ttsRes = await fetch('/api/voice/synthesize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              text: targetStory.narrationScript,
+              scenes: targetStory.scenes,
+              voiceOption: targetStory.voiceOption,
+              language: targetStory.language,
+              isPreview: false,
+            }),
+          });
+          const ttsJson = await ttsRes.json();
+          if (!ttsRes.ok) {
+            throw new Error(ttsJson.error || 'Voice synthesis failed.');
+          }
+          narDataUrl = ttsJson.audioDataUrl as string;
+          if (Array.isArray(ttsJson.sceneTimings) && ttsJson.sceneTimings.length > 0) {
+            measuredTimings = ttsJson.sceneTimings as SceneAudioTiming[];
+          }
         }
-        narDataUrl = ttsJson.audioDataUrl as string;
+        narrationDataUrlRef.current = narDataUrl;
+        sceneTimingsRef.current = measuredTimings;
+
+        setStatus('Processing');
+        setStageLabel('Composing soft magical music & syncing scene timings...');
+        setProgress(48);
+
+        const decoded = await decodeAudioDataUrl(narDataUrl);
+        narrationBuffer = decoded.buffer;
+        narrationBlob = decoded.blob;
       }
-      narrationDataUrlRef.current = narDataUrl;
 
       setStatus('Processing');
-      setStageLabel('Composing soft magical music & balancing audio levels...');
-      setProgress(56);
-
-      const { buffer: narrationBuffer, blob: narrationBlob } =
-        await decodeAudioDataUrl(narDataUrl);
+      setStageLabel('Composing soft magical music & syncing scene timings...');
+      setProgress(48);
 
       const { mixedBuffer, musicOnlyBlob, totalDurationSec, introOffsetSec } =
         await generateBalancedSoundtrack(narrationBuffer, targetStory.musicProfile);
 
+      // Lock every scene's exact duration, startTimeSec, and endTimeSec to the measured audio
+      const syncedScenes = targetStory.scenes.map((scene, idx) => {
+        const timing =
+          measuredTimings?.find((t) => t.sceneNumber === scene.sceneNumber) ??
+          measuredTimings?.[idx];
+        const narrationText = scene.narration || scene.narrationSegment;
+        const promptText = scene.imagePrompt || scene.visualDescription || narrationText;
+
+        if (timing) {
+          const isFirst = idx === 0;
+          const isLast = idx === targetStory.scenes.length - 1;
+          const start = isFirst ? 0 : introOffsetSec + timing.audioStartSec;
+          const end = isLast
+            ? totalDurationSec
+            : introOffsetSec + timing.audioEndSec;
+          const dur = Math.max(0.5, Math.round((end - start) * 100) / 100);
+          return {
+            ...scene,
+            narration: narrationText,
+            narrationSegment: narrationText,
+            imagePrompt: promptText,
+            visualDescription: promptText,
+            duration: dur,
+            startTimeSec: Math.round(start * 1000) / 1000,
+            endTimeSec: Math.round(end * 1000) / 1000,
+          };
+        }
+
+        return {
+          ...scene,
+          narration: narrationText,
+          narrationSegment: narrationText,
+          imagePrompt: promptText,
+          visualDescription: promptText,
+        };
+      });
+
+      const syncedStory: GeneratedStory = {
+        ...targetStory,
+        scenes: syncedScenes,
+        estimatedDurationSec: Math.round(totalDurationSec),
+      };
+      setStory(syncedStory);
       setDurationSeconds(totalDurationSec);
-      setStageLabel('Rendering animated characters, camera moves & MP4 video...');
-      setProgress(68);
+
+      if (isImageStory) {
+        setStageLabel('Illustrating each scene directly from its narration...');
+        setProgress(58);
+        await generateSceneIllustrations(syncedStory, (scenePct) => {
+          setProgress(58 + Math.round(scenePct * 0.12));
+        });
+      }
+
+      setStageLabel(
+        isImageStory
+          ? 'Converting synced scene illustrations into slideshow MP4 video...'
+          : 'Rendering animated characters, camera moves & MP4 video...'
+      );
+      setProgress(70);
 
       const speechTimeline = computeAmplitudeTimeline(
         narrationBuffer,
@@ -215,15 +325,25 @@ export default function App() {
         totalDurationSec
       );
 
-      const { blob: videoBlob, mimeType } = await renderAnimatedVideo(
-        targetStory,
-        mixedBuffer,
-        speechTimeline,
-        totalDurationSec,
-        (renderPct) => {
-          setProgress(68 + Math.round(renderPct * 0.32));
-        }
-      );
+      const { blob: videoBlob, mimeType } = isImageStory
+        ? await renderSlideshowVideo(
+            syncedStory,
+            mixedBuffer,
+            speechTimeline,
+            totalDurationSec,
+            (renderPct) => {
+              setProgress(70 + Math.round(renderPct * 0.3));
+            }
+          )
+        : await renderAnimatedVideo(
+            syncedStory,
+            mixedBuffer,
+            speechTimeline,
+            totalDurationSec,
+            (renderPct) => {
+              setProgress(70 + Math.round(renderPct * 0.3));
+            }
+          );
 
       setMediaObjectUrls({
         videoBlob,
@@ -232,15 +352,15 @@ export default function App() {
         mimeType,
       });
 
-      await cacheProjectMedia(targetStory.id, {
+      await cacheProjectMedia(syncedStory.id, {
         videoBlob,
         narrationBlob,
         musicBlob: musicOnlyBlob,
       });
 
       const record: StoryProjectRecord = {
-        id: targetStory.id,
-        story: targetStory,
+        id: syncedStory.id,
+        story: syncedStory,
         durationSeconds: totalDurationSec,
         status: 'Completed',
         videoMimeType: mimeType,
@@ -252,7 +372,7 @@ export default function App() {
         saveProjectHistory(next);
         return next;
       });
-      setActiveProjectId(targetStory.id);
+      setActiveProjectId(syncedStory.id);
       setStatus('Completed');
       setProgress(100);
       setStageLabel('Completed');
@@ -260,69 +380,124 @@ export default function App() {
     [setMediaObjectUrls]
   );
 
-  const handleGenerateStoryAndVideo = useCallback(async () => {
-    setErrorMessage(null);
-    setStatus('Generating');
-    setStageLabel(`Writing an original ${storyLanguage} Bible kids story...`);
-    setProgress(10);
-    setVideoUrl(null);
-    narrationDataUrlRef.current = null;
-
-    try {
-      const storyRes = await fetch('/api/story/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          language: storyLanguage,
-          voiceOption,
-          theme: themeTopic.trim(),
-          previousTitle: story?.title || '',
-        }),
-      });
-      const storyJson = await storyRes.json();
-      if (!storyRes.ok) {
-        throw new Error(storyJson.error || 'Story generation failed.');
-      }
-
-      const generatedStory = storyJson as GeneratedStory;
-      setStory(generatedStory);
-      setActiveProjectId(generatedStory.id);
-      await compileAudioAndVideoFromStory(generatedStory, null);
-    } catch (err) {
-      console.error('Pipeline failed:', err);
-      setStatus('Failed');
-      setErrorMessage(
-        err instanceof Error ? err.message : 'An unexpected error occurred.'
+  const handleGenerateStory = useCallback(
+    async (mode: StoryVideoMode = 'animated') => {
+      setErrorMessage(null);
+      setActiveGenerationMode(mode);
+      setStatus('Generating');
+      setStageLabel(
+        mode === 'image_slideshow'
+          ? `Writing ${storyLanguage} story scenes with matched narration & image prompts...`
+          : `Writing an original ${storyLanguage} Bible kids story...`
       );
-    }
-  }, [
-    storyLanguage,
-    voiceOption,
-    themeTopic,
-    story?.title,
-    compileAudioAndVideoFromStory,
-  ]);
+      setProgress(10);
+      setVideoUrl(null);
+      narrationDataUrlRef.current = null;
+      sceneTimingsRef.current = null;
+
+      try {
+        const storyRes = await fetch('/api/story/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            language: storyLanguage,
+            voiceOption,
+            theme: themeTopic.trim(),
+            previousTitle: story?.title || '',
+            mode,
+          }),
+        });
+        const storyJson = await storyRes.json();
+        if (!storyRes.ok) {
+          throw new Error(storyJson.error || 'Story generation failed.');
+        }
+
+        const rawStory = storyJson as GeneratedStory;
+        const resolvedMode = rawStory.videoMode || mode;
+        const generatedStory: GeneratedStory = {
+          ...rawStory,
+          videoMode: resolvedMode,
+          scenes: rawStory.scenes.map((scene) => {
+            const narrationText = scene.narration || scene.narrationSegment || '';
+            const promptText = scene.imagePrompt || scene.visualDescription || narrationText;
+            return {
+              ...scene,
+              narration: narrationText,
+              narrationSegment: narrationText,
+              imagePrompt: promptText,
+              visualDescription: promptText,
+              characters:
+                resolvedMode === 'image_slideshow'
+                  ? (scene.characters || []).map((c) => ({ ...c, endX: c.startX }))
+                  : scene.characters || [],
+            };
+          }),
+        };
+        setStory(generatedStory);
+        setActiveProjectId(generatedStory.id);
+        await compileAudioAndVideoFromStory(generatedStory, null);
+      } catch (err) {
+        console.error('Pipeline failed:', err);
+        setStatus('Failed');
+        setErrorMessage(
+          err instanceof Error ? err.message : 'An unexpected error occurred.'
+        );
+      } finally {
+        setActiveGenerationMode(null);
+      }
+    },
+    [
+      storyLanguage,
+      voiceOption,
+      themeTopic,
+      story?.title,
+      compileAudioAndVideoFromStory,
+    ]
+  );
 
   const handleRegenerateVideo = useCallback(async () => {
     if (!story) return;
+    const mode = story.videoMode || 'animated';
+    setActiveGenerationMode(mode);
     try {
       const updatedStory: GeneratedStory = {
         ...story,
         voiceOption,
         language: storyLanguage,
+        videoMode: mode,
       };
       setStory(updatedStory);
+      const reuseExistingAudio =
+        voiceOption === story.voiceOption && storyLanguage === story.language;
       await compileAudioAndVideoFromStory(
         updatedStory,
-        voiceOption === story.voiceOption ? narrationDataUrlRef.current : null
+        reuseExistingAudio ? narrationDataUrlRef.current : null
       );
     } catch (err) {
       setStatus('Failed');
       setErrorMessage(
         err instanceof Error ? err.message : 'Failed to regenerate video.'
       );
+    } finally {
+      setActiveGenerationMode(null);
     }
   }, [story, voiceOption, storyLanguage, compileAudioAndVideoFromStory]);
+
+  const handleContinueMusicOnly = useCallback(async () => {
+    if (!story) return;
+    const mode = story.videoMode || 'animated';
+    setActiveGenerationMode(mode);
+    try {
+      await compileAudioAndVideoFromStory(story, null, true);
+    } catch (err) {
+      setStatus('Failed');
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Failed to render music-only video.'
+      );
+    } finally {
+      setActiveGenerationMode(null);
+    }
+  }, [story, compileAudioAndVideoFromStory]);
 
   const handleDownloadScript = () => {
     if (!story) return;
@@ -462,10 +637,14 @@ export default function App() {
         navHistory={copy.navHistory}
         generateLabel={copy.generateBtn}
         generatingLabel={copy.generatingBtn}
+        generateImageStoryLabel={copy.generateImageStoryBtn}
+        generatingImageStoryLabel={copy.generatingImageStoryBtn}
         isBusy={isBusy}
+        activeGenerationMode={activeGenerationMode}
         activeSection={activeSection}
         onNavigate={handleNavigate}
-        onGenerate={handleGenerateStoryAndVideo}
+        onGenerate={() => handleGenerateStory('animated')}
+        onGenerateImageStory={() => handleGenerateStory('image_slideshow')}
       />
 
       {/* Toast Notification */}
@@ -655,8 +834,9 @@ export default function App() {
           durationSeconds={durationSeconds}
           errorMessage={errorMessage}
           copy={copy}
-          onRegenerateStory={handleGenerateStoryAndVideo}
+          onRegenerateStory={() => handleGenerateStory(story?.videoMode || 'animated')}
           onRegenerateVideo={handleRegenerateVideo}
+          onContinueMusicOnly={handleContinueMusicOnly}
           onDownloadScript={handleDownloadScript}
         />
 

@@ -116,6 +116,18 @@ export function computeAmplitudeTimeline(
   return timeline;
 }
 
+export function createSilentNarrationTrack(durationSec: number): {
+  buffer: AudioBuffer;
+  blob: Blob;
+} {
+  const safeDuration = Math.max(12, Math.min(300, durationSec));
+  const sampleRate = 24000;
+  const ctx = new OfflineAudioContext(1, Math.ceil(safeDuration * sampleRate), sampleRate);
+  const buffer = ctx.createBuffer(1, Math.ceil(safeDuration * sampleRate), sampleRate);
+  const blob = encodeAudioBufferToWav(buffer);
+  return { buffer, blob };
+}
+
 export async function generateBalancedSoundtrack(
   narrationBuffer: AudioBuffer,
   musicProfile: MusicProfile

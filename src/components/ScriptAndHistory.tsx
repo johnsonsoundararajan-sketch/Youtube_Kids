@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { BookOpen, CheckCircle2, Film, FolderOpen, Trash2 } from 'lucide-react';
 import type { GeneratedStory, StoryProjectRecord } from '../types/story';
+import { generateSceneIllustrations } from '../lib/imageStoryRenderer';
 import type { UI_COPY } from '../lib/i18n';
 
 interface ScriptAndHistoryProps {
@@ -24,10 +25,38 @@ export function ScriptAndHistory({
 }: ScriptAndHistoryProps) {
   const [tab, setTab] = useState<'script' | 'scenes'>('script');
   const [imgError, setImgError] = useState(false);
+  const [sceneThumbs, setSceneThumbs] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!story || story.videoMode !== 'image_slideshow') {
+      setSceneThumbs([]);
+      return;
+    }
+    void generateSceneIllustrations(story).then((plates) => {
+      if (cancelled) return;
+      const thumbs = plates.map((plate) => {
+        const thumbCanvas = document.createElement('canvas');
+        thumbCanvas.width = 320;
+        thumbCanvas.height = 180;
+        const tctx = thumbCanvas.getContext('2d');
+        if (tctx) {
+          tctx.drawImage(plate, 0, 0, 320, 180);
+        }
+        return thumbCanvas.toDataURL('image/jpeg', 0.82);
+      });
+      setSceneThumbs(thumbs);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [story]);
+
+  const isImageStory = story?.videoMode === 'image_slideshow';
 
   return (
     <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-      {/* Story Script & Animated Scenes */}
+      {/* Story Script & Animated/Illustrated Scenes */}
       <section
         id="script"
         className="lg:col-span-7 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-6"
@@ -61,7 +90,7 @@ export function ScriptAndHistory({
                   : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              {copy.sceneTimeline}
+              {isImageStory ? copy.sceneIllustrationsTab : copy.sceneTimeline}
             </button>
           </div>
         </div>
@@ -88,7 +117,7 @@ export function ScriptAndHistory({
                 Original Bible Storytelling Script
               </h3>
               <p className="mt-1.5 text-sm text-slate-600 dark:text-slate-400 leading-relaxed">
-                Every generated story includes a positive moral lesson, scripture reference, 2–3 minute child-friendly narration in English or Tamil, and 8 animated character scenes.
+                Every generated story includes a positive moral lesson, scripture reference, 2–3 minute child-friendly narration in English or Tamil, and 8 continuous story scenes.
               </p>
             </div>
           </div>
@@ -115,30 +144,58 @@ export function ScriptAndHistory({
 
             <div className="max-h-72 overflow-y-auto pr-2 space-y-3 text-sm leading-relaxed text-slate-700 dark:text-slate-300">
               {story.scenes.map((scene) => (
-                <p key={scene.sceneNumber}>{scene.narrationSegment}</p>
+                <p key={scene.sceneNumber}>{scene.narration || scene.narrationSegment}</p>
               ))}
             </div>
           </div>
         ) : (
           <div className="mt-5 max-h-80 overflow-y-auto pr-1 divide-y divide-slate-200 dark:divide-slate-800">
-            {story.scenes.map((scene) => (
-              <div key={scene.sceneNumber} className="py-3 first:pt-0 last:pb-0">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-sm font-semibold text-slate-900 dark:text-white">
-                    <span className="font-mono text-xs text-violet-700 dark:text-violet-400 mr-2 tabular-nums">
-                      {String(scene.sceneNumber).padStart(2, '0')}
-                    </span>
-                    {scene.title}
-                  </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap">
-                    {scene.environment} · {scene.cameraMove}
+            {story.scenes.map((scene, idx) => {
+              const thumb = sceneThumbs[idx];
+              const scenePrompt = scene.imagePrompt || scene.visualDescription;
+              const sceneNarration = scene.narration || scene.narrationSegment;
+              const sceneDur =
+                typeof scene.duration === 'number' && scene.duration > 0
+                  ? `${scene.duration.toFixed(1)}s`
+                  : null;
+              return (
+                <div
+                  key={scene.sceneNumber}
+                  className="py-3 first:pt-0 last:pb-0 flex items-start gap-3"
+                >
+                  {isImageStory && thumb && (
+                    <img
+                      src={thumb}
+                      alt={scene.title}
+                      className="h-16 w-28 shrink-0 rounded-md border border-slate-200 dark:border-slate-700 object-cover"
+                    />
+                  )}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="truncate text-sm font-semibold text-slate-900 dark:text-white">
+                        <span className="font-mono text-xs text-violet-700 dark:text-violet-400 mr-2 tabular-nums">
+                          {String(scene.sceneNumber).padStart(2, '0')}
+                        </span>
+                        {scene.title}
+                      </div>
+                      <div className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap font-mono tabular-nums">
+                        {scene.environment} · {sceneDur ?? scene.cameraMove}
+                      </div>
+                    </div>
+                    {scenePrompt && (
+                      <p className="mt-1 text-xs text-slate-600 dark:text-slate-300 line-clamp-2">
+                        {scenePrompt}
+                      </p>
+                    )}
+                    {sceneNarration && (
+                      <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400 line-clamp-1">
+                        {sceneNarration}
+                      </p>
+                    )}
                   </div>
                 </div>
-                <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-                  {scene.characters.map((c) => `${c.name} (${c.action})`).join(', ')}
-                </p>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </section>
@@ -179,6 +236,14 @@ export function ScriptAndHistory({
                       </div>
                       <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
                         <span>{item.story.language}</span>
+                        {item.story.videoMode === 'image_slideshow' && (
+                          <>
+                            <span aria-hidden="true">·</span>
+                            <span className="text-violet-700 dark:text-violet-400 font-medium">
+                              {copy.imageStoryModeLabel}
+                            </span>
+                          </>
+                        )}
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">
                           {Math.floor(item.durationSeconds / 60)}:

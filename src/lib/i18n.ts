@@ -9,6 +9,11 @@ export const UI_COPY: Record<
     navHistory: string;
     generateBtn: string;
     generatingBtn: string;
+    generateImageStoryBtn: string;
+    generatingImageStoryBtn: string;
+    imageStoryModeLabel: string;
+    animatedModeLabel: string;
+    sceneIllustrationsTab: string;
     storyLanguage: string;
     voiceStyle: string;
     themeLabel: string;
@@ -60,6 +65,11 @@ export const UI_COPY: Record<
     navHistory: 'History',
     generateBtn: 'Generate Story & Video',
     generatingBtn: 'Creating Story & Video...',
+    generateImageStoryBtn: 'Generate Image Story',
+    generatingImageStoryBtn: 'Creating Image Story...',
+    imageStoryModeLabel: 'Image Story',
+    animatedModeLabel: 'Animated Story',
+    sceneIllustrationsTab: 'Scene Illustrations',
     storyLanguage: 'Story Language',
     voiceStyle: 'Narration Voice',
     themeLabel: 'Story Topic (Optional)',
@@ -84,11 +94,11 @@ export const UI_COPY: Record<
     storyScript: 'Story Script',
     sceneTimeline: 'Animated Scenes',
     historyTitle: 'Story History',
-    historyEmpty: 'No stories generated yet. Click Generate Story & Video to create your first animated Bible story.',
+    historyEmpty: 'No stories generated yet. Click Generate Story & Video or Generate Image Story to create your first Bible story.',
     loadProject: 'Open in Studio',
     deleteProject: 'Remove',
-    emptyStageTitle: 'Ready to Animate a New Bible Story',
-    emptyStageSubtitle: 'Generates an original 2–3 minute kids Bible story, expressive voice narration, balanced magical music, and full animated video.',
+    emptyStageTitle: 'Ready to Create a New Bible Story',
+    emptyStageSubtitle: 'Choose animated character storytelling or storyline-matched scene illustration slideshow mode with exact narration sync and balanced music.',
     approvalTitle: 'YouTube Publishing & Approval Studio',
     copyMetadata: 'Copy Metadata',
     copied: 'Copied',
@@ -110,6 +120,11 @@ export const UI_COPY: Record<
     navHistory: 'வரலாறு',
     generateBtn: 'கதை & வீடியோ உருவாக்கு',
     generatingBtn: 'உருவாக்கப்படுகிறது...',
+    generateImageStoryBtn: 'படக் கதை உருவாக்கு',
+    generatingImageStoryBtn: 'படக் கதை உருவாகிறது...',
+    imageStoryModeLabel: 'படக் கதை',
+    animatedModeLabel: 'அனிமேஷன் கதை',
+    sceneIllustrationsTab: 'காட்சி படங்கள்',
     storyLanguage: 'கதை மொழி',
     voiceStyle: 'குரல் வகை',
     themeLabel: 'கதை தலைப்பு (விருப்பம்)',
@@ -134,11 +149,11 @@ export const UI_COPY: Record<
     storyScript: 'முழு கதை',
     sceneTimeline: 'அனிமேஷன் காட்சிகள்',
     historyTitle: 'கதை வரலாறு',
-    historyEmpty: 'இன்னும் கதைகள் எதுவும் உருவாக்கப்படவில்லை. தொடங்க Generate Story & Video பொத்தானை அழுத்தவும்.',
+    historyEmpty: 'இன்னும் கதைகள் எதுவும் உருவாக்கப்படவில்லை. தொடங்க Generate Story & Video அல்லது Generate Image Story பொத்தானை அழுத்தவும்.',
     loadProject: 'திறக்கவும்',
     deleteProject: 'நீக்கு',
-    emptyStageTitle: 'புதிய வேதாகம அனிமேஷன் கதையை உருவாக்க தயாராக உள்ளது',
-    emptyStageSubtitle: 'குழந்தைகளுக்கான 2–3 நிமிட கதை, இனிமையான குரல், பின்னணி இசை மற்றும் முழு அனிமேஷன் வீடியோவை உருவாக்குகிறது.',
+    emptyStageTitle: 'புதிய வேதாகம கதையை உருவாக்க தயாராக உள்ளது',
+    emptyStageSubtitle: 'அனிமேஷன் கதை அல்லது கதை வரிகளுடன் பொருந்திய காட்சிப் பட ஸ்லைடுஷோ முறையில் இனிமையான குரல் மற்றும் இசையுடன் வீடியோவை உருவாக்குங்கள்.',
     approvalTitle: 'YouTube வெளியீடு & ஒப்புதல்',
     copyMetadata: 'விவரங்களை நகலெடு',
     copied: 'நகலெடுக்கப்பட்டது',

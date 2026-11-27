@@ -1,4 +1,5 @@
-import { Sparkles, Loader2 } from 'lucide-react';
+import { Sparkles, Loader2, Images } from 'lucide-react';
+import type { StoryVideoMode } from '../types/story';
 
 interface HeaderBarProps {
   title: string;
@@ -7,10 +8,14 @@ interface HeaderBarProps {
   navHistory: string;
   generateLabel: string;
   generatingLabel: string;
+  generateImageStoryLabel: string;
+  generatingImageStoryLabel: string;
   isBusy: boolean;
+  activeGenerationMode: StoryVideoMode | null;
   activeSection: 'studio' | 'script' | 'history';
   onNavigate: (section: 'studio' | 'script' | 'history') => void;
   onGenerate: () => void;
+  onGenerateImageStory: () => void;
 }
 
 export function HeaderBar({
@@ -20,14 +25,21 @@ export function HeaderBar({
   navHistory,
   generateLabel,
   generatingLabel,
+  generateImageStoryLabel,
+  generatingImageStoryLabel,
   isBusy,
+  activeGenerationMode,
   activeSection,
   onNavigate,
   onGenerate,
+  onGenerateImageStory,
 }: HeaderBarProps) {
+  const isAnimatedBusy = isBusy && activeGenerationMode !== 'image_slideshow';
+  const isImageBusy = isBusy && activeGenerationMode === 'image_slideshow';
+
   return (
     <header className="sticky top-0 z-30 border-b border-slate-200 dark:border-slate-800 bg-white/95 dark:bg-slate-950/95 backdrop-blur-sm">
-      <div className="mx-auto flex max-w-6xl items-center justify-between gap-8 px-6 py-4">
+      <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-6 py-4">
         <a
           href="#studio"
           onClick={(e) => {
@@ -41,7 +53,7 @@ export function HeaderBar({
 
         <nav
           aria-label="Primary"
-          className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-300"
+          className="hidden lg:flex items-center gap-6 text-sm font-medium text-slate-600 dark:text-slate-300"
         >
           <button
             type="button"
@@ -78,19 +90,33 @@ export function HeaderBar({
           </button>
         </nav>
 
-        <div className="flex items-center shrink-0">
+        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
           <button
             type="button"
             disabled={isBusy}
             onClick={onGenerate}
             className="inline-flex items-center gap-2 rounded-lg bg-violet-700 hover:bg-violet-800 disabled:opacity-60 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-white transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
           >
-            {isBusy ? (
+            {isAnimatedBusy ? (
               <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
             ) : (
               <Sparkles className="h-4 w-4" aria-hidden="true" />
             )}
-            <span>{isBusy ? generatingLabel : generateLabel}</span>
+            <span>{isAnimatedBusy ? generatingLabel : generateLabel}</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={isBusy}
+            onClick={onGenerateImageStory}
+            className="inline-flex items-center gap-2 rounded-lg border border-violet-300 dark:border-violet-700 bg-violet-50 dark:bg-violet-950/60 hover:bg-violet-100 dark:hover:bg-violet-900/70 disabled:opacity-60 disabled:cursor-not-allowed px-4 py-2.5 text-sm font-semibold text-violet-800 dark:text-violet-200 transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-600 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-slate-950"
+          >
+            {isImageBusy ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+            ) : (
+              <Images className="h-4 w-4" aria-hidden="true" />
+            )}
+            <span>{isImageBusy ? generatingImageStoryLabel : generateImageStoryLabel}</span>
           </button>
         </div>
       </div>
